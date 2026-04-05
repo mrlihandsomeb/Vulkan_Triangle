@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <cstring>
 #include <vector>
+#include <optional>
 
 const uint32_t WIDTH = 800;
 const uint32_t HEIGHT = 600;
@@ -48,6 +49,19 @@ void DestroyDebugUtilsMessengerEXT(
 	}
 }
 
+//物理设备（GPU）队列族的索引：从queueFamilies里面的索引找来的，如果这个families里面的familiy有
+//相应功能那么就给这个索引里面的值附上那个索引值i。到时候去哪个families里面找
+struct QueueFamilyIndices
+{
+	//检验是否被真正赋值，因为每一个uint32_t都可能代表一个队列族
+	std::optional<uint32_t> graphicsFamily;
+
+	bool isComplete()
+	{
+		return graphicsFamily.has_value();
+	}
+};
+
 
 class TriangleApplication
 {
@@ -63,9 +77,12 @@ public:
 
 private:
 
-	GLFWwindow* window;
-	VkInstance instance;
-	VkDebugUtilsMessengerEXT debugMessenger;
+	GLFWwindow* window;									//窗口
+	VkInstance instance;								//实例
+	VkDebugUtilsMessengerEXT debugMessenger;			//传递信息的
+	VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;	//物理设备（GPU）
+	VkDevice device;									//逻辑设备
+	VkQueue graphicsQueue;								//跟随逻辑设备一同创建的队列的句柄
 
 
 	void initWindow()
@@ -83,6 +100,8 @@ private:
 	{
 		creatInstance();
 		setupDebugMessenger();
+		pickPhysicalDevice();
+		createLogicalDevice();
 	}
 
 	void mainLoop()
@@ -99,6 +118,7 @@ private:
 		{
 			DestroyDebugUtilsMessengerEXT(instance, debugMessenger, nullptr);
 		}
+		vkDestroyDevice(device, nullptr);
 		vkDestroyInstance(instance, nullptr);
 		
 
@@ -169,6 +189,7 @@ private:
 		////////
 	}
 
+	//debug验证层 
 	void setupDebugMessenger()
 	{
 		if (!enableValidationLayers) return;
@@ -240,7 +261,7 @@ private:
 		return extentions;
 	}
 
-	//具体这个debugMessenger会干什么
+	      //具体这个debugMessenger会干什么
 	static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallBack(
 		VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity,
 		VkDebugUtilsMessageTypeFlagsEXT messageType,
@@ -252,6 +273,104 @@ private:
 		std::cerr << "validation layer:" << pcallBackData->pMessage << std::endl;
 		
 		return VK_FALSE;
+	}
+
+	//物理设备查照
+	void pickPhysicalDevice()
+	{
+		uint32_t deviceCount{ 0 };
+		vkEnumeratePhysicalDevices(instance, &deviceCount, nullptr);
+		if (deviceCount == 0)
+		{
+			throw std::runtime_error("failed to find GPUs with Vulkan support");
+		}
+		std::vector<VkPhysicalDevice> devices(deviceCount);
+		vkEnumeratePhysicalDevices(instance, &deviceCount, devices.data());
+
+		//验证设备是否可用
+		for (const auto& device : devices)
+		{
+			if (isDeviceSuitable(device))
+			{
+				physicalDevice = device;
+				break;
+			}
+		}
+		if (physicalDevice == VK_NULL_HANDLE)
+		{
+			throw std::runtime_error("fail to find a suitable GPU");
+		}
+
+	}
+
+	bool isDeviceSuitable(VkPhysicalDevice physicalDevice)
+	{
+		VkPhysicalDeviceProperties deviceProperties;
+		VkPhysicalDeviceFeatures deviceFeatures;
+		vkGetPhysicalDeviceProperties(physicalDevice, &deviceProperties);
+		vkGetPhysicalDeviceFeatures(physicalDevice, &deviceFeatures);
+
+		QueueFamilyIndices indice = findQueueFamilies(physicalDevice);
+		return deviceProperties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU &&
+											  deviceFeatures.geometryShader &&
+											  indice.isComplete();
+	}
+
+	     //物理设备队列族查照
+	QueueFamilyIndices findQueueFamilies(VkPhysicalDevice device)
+	{
+		QueueFamilyIndices indices;
+
+		uint32_t queueFamilyCount{ 0 };
+		vkGetPhysicalDeviceQueueFamilyProperties(device, &queueFamilyCount, nullptr);
+		std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
+		vkGetPhysicalDeviceQueueFamilyProperties(device, &queueFamilyCount, queueFamilies.data());
+
+		int i{ 0 };
+		for (auto& queueFamily : queueFamilies)
+		{
+			if (queueFamily.queueFlags & VK_QUEUE_GRAPHICS_BIT)
+			{
+				indices.graphicsFamily = i;
+			}
+			if (indices.isComplete())
+			{
+				break;
+			}
+			i++;
+		}
+
+		return indices;
+	}
+
+	//逻辑设备创建
+	void createLogicalDevice()
+	{
+		QueueFamilyIndices indice = findQueueFamilies(physicalDevice);
+
+		VkDeviceQueueCreateInfo queueCreateInfo{};
+		queueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+		queueCreateInfo.queueFamilyIndex = indice.graphicsFamily.value();
+		queueCreateInfo.queueCount = 1;
+		float queuePriority = 1.0f;
+		queueCreateInfo.pQueuePriorities = &queuePriority;       //指针是因为能为多个队列设置优先级
+
+		VkPhysicalDeviceFeatures deviceFeatures{};
+
+		VkDeviceCreateInfo createInfo{};
+		createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+		createInfo.pQueueCreateInfos = &queueCreateInfo;
+		createInfo.queueCreateInfoCount = 1;
+		createInfo.pEnabledFeatures = &deviceFeatures;
+		createInfo.enabledExtensionCount = 0;
+
+		if (vkCreateDevice(physicalDevice, &createInfo, nullptr, &device) != VK_SUCCESS)
+		{
+			throw std::runtime_error("fail to create logical device");
+		}
+
+		//第二个参数是索引（队列族索引），第三个参数也是索引（不过这个索引的创建的队列的索引，因为之创建了一个所以为0）
+		vkGetDeviceQueue(device, indice.graphicsFamily.value(), 0, &graphicsQueue);
 	}
 };
 
