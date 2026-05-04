@@ -111,6 +111,12 @@ private:
 	VkRenderPass renderPass;							//渲染过程
 	VkPipelineLayout pipeLineLayout;					//管线布局，在管线创建前使用
 	VkPipeline graphicsPipeLine;
+	std::vector<VkFramebuffer> swapChainFramBuffers;   //帧缓冲区
+	VkCommandPool commandPool;						   //命令池,用于管理命令缓冲区的内存
+	VkCommandBuffer commandBuffer;					   //命令缓冲区
+	VkSemaphore imageAvalableSemaphore;				   //信号量:image是否可以用
+	VkSemaphore renderFinishedSemaphore;			   //信号量:image是否画完了
+	VkFence inFlightFence;							   //栅栏帧:是否画完了
 
 
 
@@ -137,6 +143,10 @@ private:
 		createImageViews();
 		createRenderPass();
 		createGraphicsPipeLine();
+		createFrameBuffers();
+		createCommandPool();
+		createCommandBuffer();
+		createSyncObiects();
 	}
 
 	void mainLoop()
@@ -144,15 +154,21 @@ private:
 		while (!glfwWindowShouldClose(window))
 		{
 			glfwPollEvents();
+			drawFrame();
 		}
+
+		vkDeviceWaitIdle(device); //等待device内部任务完成后结束
 	}
 
 	void cleanup()
 	{
+		destroySyncObjects();           //封装了多个vkDestroySemaphore()和vkDestroyFence()
+		vkDestroyCommandPool(device, commandPool, nullptr);
+		destroyFrameBuffers();          //封装了多个vkDestroyFrameBuffer()来摧毁帧缓冲
 		vkDestroyPipeline(device, graphicsPipeLine, nullptr);
 		vkDestroyPipelineLayout(device, pipeLineLayout, nullptr); 
 		vkDestroyRenderPass(device, renderPass, nullptr);
-		destoryImageViews();			//封装了多个vkDestroyImageView()来摧毁多个视图
+		destroyImageViews();			//封装了多个vkDestroyImageView()来摧毁多个视图
 		vkDestroySwapchainKHR(device, swapChain, nullptr);
 		vkDestroyDevice(device, nullptr);
 		if (enableValidationLayers)
@@ -658,7 +674,7 @@ private:
 	}
 
 	//封装一个销毁函数
-	void destoryImageViews()
+	void destroyImageViews()
 	{
 		for (auto view : swapChainImageViews)
 		{
@@ -708,19 +724,29 @@ private:
 		* pPreserveAttachments：此子过程未使用但必须保留数据的附件
 		*/
 
+		VkSubpassDependency dependency{};
+		dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+		dependency.dstSubpass = 0;
+		dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;   //等待图像管线颜色输出阶段完成后，再开始子渲染过程
+		dependency.srcAccessMask = 0;  //前一个阶段一定要完成什么，0代表啥也不干
+		dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+		dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+
 		VkRenderPassCreateInfo renderPassCreateInfo{};
 		renderPassCreateInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
 		renderPassCreateInfo.attachmentCount = 1;
 		renderPassCreateInfo.pAttachments = &colorAttachment;
 		renderPassCreateInfo.subpassCount = 1;
 		renderPassCreateInfo.pSubpasses = &subpass;
+		renderPassCreateInfo.dependencyCount = 1;
+		renderPassCreateInfo.pDependencies = &dependency;
 		
 		if (vkCreateRenderPass(device, &renderPassCreateInfo, nullptr, &renderPass) != VK_SUCCESS)
 		{
 			throw std::runtime_error("fail to create render pass");
 		}
 	}
-
 
 	//创建图像管线
 	/*
@@ -915,7 +941,6 @@ private:
 		vkDestroyShaderModule(device, vertShaderModule, nullptr);
 	}
 
-
 	//读取着色器spir-v
 	static std::vector<char> readFile(const std::string & filename)
 	{
@@ -950,6 +975,209 @@ private:
 		}
 
 		return shaderModule;
+	}
+
+	//创建帧缓冲
+	void createFrameBuffers()
+	{
+		swapChainFramBuffers.resize(swapChainImageViews.size());
+
+		for (size_t i = 0; i < swapChainFramBuffers.size(); ++i)
+		{
+			VkImageView attachment[] = { swapChainImageViews[i] };
+
+			VkFramebufferCreateInfo createInfo{};
+			createInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+			createInfo.renderPass = renderPass;
+			createInfo.width = swapChainImageExtent.width;
+			createInfo.height = swapChainImageExtent.height;
+			createInfo.attachmentCount = 1;
+			createInfo.pAttachments = attachment;
+			createInfo.layers = 1;						//该帧缓冲中每个附件图像的数组层数（即图像包含多少独立的 2D 层）
+
+			if (vkCreateFramebuffer(device, &createInfo, nullptr, &swapChainFramBuffers[i]) != VK_SUCCESS)
+			{
+				throw std::runtime_error("fail to create a framebuffer");
+			}
+		}
+	}
+
+	//封装一个销毁函数
+	void destroyFrameBuffers()
+	{
+		for (auto frameBuffer : swapChainFramBuffers)
+		{
+			vkDestroyFramebuffer(device, frameBuffer, nullptr);
+		}
+	}
+
+	//创建命令池
+	void createCommandPool()
+	{
+		QueueFamilyIndices queueFamilyIndices = findQueueFamilies(physicalDevice);
+
+		VkCommandPoolCreateInfo createInfo{};
+
+		createInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+		createInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+		//VK_COMMAND_POOL_CREATE_TRANSIENT_BIT 提示命令缓冲区经常被新的命令重新记录
+		//VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT 允许单独重新记录命令缓冲区，如果没有此标志，则必须一起重置所有命令缓冲区
+		createInfo.queueFamilyIndex = queueFamilyIndices.graphicsFamily.value(); //指定命令池分配的缓冲区是给什么队列用的
+
+		if (vkCreateCommandPool(device, &createInfo, nullptr, &commandPool) != VK_SUCCESS)
+		{
+			throw std::runtime_error("fail to create command pool");
+		}
+	}
+
+	//创建命令缓冲区
+	void createCommandBuffer()
+	{
+		VkCommandBufferAllocateInfo allocInfo{};
+
+		allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+		allocInfo.commandPool = commandPool;
+		allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+		//VK_COMMAND_BUFFER_LEVEL_PRIMARY 可以提交到队列执行，但不能在其他缓冲区调用
+		//VK_COMMAND_BUFFER_LEVEL_SECONDARY 不能直接提交到队列，需要在主命令缓冲区调用
+		allocInfo.commandBufferCount = 1;
+
+		if (vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer) != VK_SUCCESS)
+		{
+			throw std::runtime_error("fail to allocate command buffer");
+		}
+	}
+
+	//记录命令缓冲区的命令,并开启渲染通道
+	void recordCommandBuffer(VkCommandBuffer commandBuffer,uint32_t imageIndex)
+	{
+		VkCommandBufferBeginInfo beginInfo{};
+		beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+		beginInfo.flags = 0;
+		//VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT 命令缓冲区将在执行(gpu执行缓冲区中的内容)一次后立即重新记录。
+		//VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT 这是一个辅助命令缓冲区，它将完全位于一个渲染通道内。也就是说他必须在一个已经活动的渲染通道内调用
+		//VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT 命令缓冲区在已处于挂起执行(提交但未完全执行)状态时可以重新提交。
+		beginInfo.pInheritanceInfo = nullptr; //用于辅助命令缓冲区,决定继承主命令缓冲区什么状态
+
+		if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS)
+		{
+			throw std::runtime_error("fail to begin recording command buffer");
+		}
+		//如果命令缓冲区已经被记录过一次，那么对 vkBeginCommandBuffer 的调用将隐式重置它。
+
+		VkRenderPassBeginInfo renderPassBeginInfo{};
+
+		renderPassBeginInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+		renderPassBeginInfo.renderPass = renderPass;
+		renderPassBeginInfo.framebuffer = swapChainFramBuffers[imageIndex];
+		renderPassBeginInfo.renderArea.extent = swapChainImageExtent;
+		renderPassBeginInfo.renderArea.offset = { 0,0 };
+		VkClearValue clearColor = { {{0.0f,0.0f,0.0f,1.0f}} };
+		renderPassBeginInfo.clearValueCount = 1;
+		renderPassBeginInfo.pClearValues = &clearColor;
+
+		vkCmdBeginRenderPass(commandBuffer, &renderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
+		//VK_SUBPASS_CONTENTS_INLINE 渲染通道命令将嵌入到主命令缓冲区本身中，并且不会执行辅助命令缓冲区。
+		//VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS 渲染通道命令将从辅助命令缓冲区执行。
+
+		vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeLine);
+
+		VkViewport viewPort{};
+		viewPort.x = 0.0f;
+		viewPort.y = 0.0f;
+		viewPort.width = static_cast<float>(swapChainImageExtent.width);
+		viewPort.height = static_cast<float>(swapChainImageExtent.height);
+		viewPort.minDepth = 0.0f;
+		viewPort.maxDepth = 1.0f;
+		vkCmdSetViewport(commandBuffer, 0, 1, &viewPort);
+
+		VkRect2D scissor{};
+		scissor.extent = swapChainImageExtent;
+		scissor.offset = { 0,0 };
+		vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+
+		vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+
+		vkCmdEndRenderPass(commandBuffer);
+
+		if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS)
+		{
+			throw std::runtime_error("fail to record command buffer");
+		}
+	}
+
+	//绘画缓冲区
+	void drawFrame()
+	{
+		vkWaitForFences(device, 1, &inFlightFence, VK_TRUE, UINT64_MAX);
+		vkResetFences(device, 1, &inFlightFence);
+
+		uint32_t imageIndex{};
+		vkAcquireNextImageKHR(device, swapChain, UINT64_MAX, imageAvalableSemaphore, VK_NULL_HANDLE, &imageIndex);
+
+		vkResetCommandBuffer(commandBuffer, 0);
+		recordCommandBuffer(commandBuffer, imageIndex);
+
+		VkSubmitInfo submitInfo{};
+		submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+
+		VkSemaphore waitSemaphore[] = { imageAvalableSemaphore };
+		VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
+		submitInfo.commandBufferCount = 1;
+		submitInfo.pCommandBuffers = &commandBuffer;
+		submitInfo.waitSemaphoreCount = 1;
+		submitInfo.pWaitSemaphores = waitSemaphore;
+		submitInfo.pWaitDstStageMask = waitStages;
+		VkSemaphore signaledSemaphore[] = { renderFinishedSemaphore };
+		submitInfo.signalSemaphoreCount = 1;
+		submitInfo.pSignalSemaphores = signaledSemaphore;
+
+		if (vkQueueSubmit(graphicsQueue, 1, &submitInfo, inFlightFence) != VK_SUCCESS)
+		{
+			throw std::runtime_error("fail to submit command buffer");
+		}
+
+		VkPresentInfoKHR presentInfo{};
+		presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+		presentInfo.pImageIndices = &imageIndex;
+		presentInfo.waitSemaphoreCount = 1;
+		presentInfo.pWaitSemaphores = signaledSemaphore;
+		presentInfo.swapchainCount = 1;
+		presentInfo.pSwapchains = &swapChain;
+		presentInfo.pResults = nullptr;
+		
+		if (vkQueuePresentKHR(presentQueue, &presentInfo) != VK_SUCCESS)
+		{
+			throw std::runtime_error("fail to present queue");
+		}
+
+	}
+
+	//创建同步对象
+	void createSyncObiects()
+	{
+		VkSemaphoreCreateInfo semaphoreCreateInfo{};
+		semaphoreCreateInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+
+		VkFenceCreateInfo fenceCreateInfo{};
+		fenceCreateInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+		fenceCreateInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;		//创建一个有信号的fence用来激发第一帧
+
+		if (vkCreateSemaphore(device, &semaphoreCreateInfo, nullptr, &imageAvalableSemaphore) != VK_SUCCESS ||
+			vkCreateSemaphore(device, &semaphoreCreateInfo, nullptr, &renderFinishedSemaphore) != VK_SUCCESS ||
+			vkCreateFence(device, &fenceCreateInfo, nullptr, &inFlightFence) != VK_SUCCESS
+			)
+		{
+			throw std::runtime_error("fail to create sync objects");
+		}
+	}
+
+	//封装一个摧毁函数
+	void destroySyncObjects()
+	{
+		vkDestroySemaphore(device, imageAvalableSemaphore, nullptr);
+		vkDestroySemaphore(device, renderFinishedSemaphore, nullptr);
+		vkDestroyFence(device, inFlightFence, nullptr);
 	}
 };
 
