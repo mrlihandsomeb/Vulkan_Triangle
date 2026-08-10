@@ -123,7 +123,7 @@ struct Vertex
 
 const std::vector<Vertex> vertices{
 	{{0.0f,-0.5f},{1.0f,1.0f,1.0f}},
-	{{0.5f,0.5f},{0.0f,1.0f,0.0f}},
+	{{0.5f,0.5f},{0.49f,0.545f,0.576f}},
 	{{-0.5f,0.5f},{0.0f,0.0f,1.0f}}
 };
 
@@ -160,6 +160,7 @@ private:
 	std::vector<VkFramebuffer> swapChainFramBuffers;    //帧缓冲区
 	VkCommandPool commandPool;						    //命令池,用于管理命令缓冲区的内存
 	std::vector<VkCommandBuffer> commandBuffers;	    //命令缓冲区
+	VkCommandPool stagingCommandPool;					//为填充暂存缓冲区而准备的单独的命令池
 	VkBuffer vertexBuffer;								//顶点缓冲区	
 	VkDeviceMemory vertexBufferMemory;					//顶点缓冲区分配的内存
 	std::vector<VkSemaphore> imageAvalableSemaphores;   //信号量:image是否可以用
@@ -167,7 +168,6 @@ private:
 	std::vector<VkFence> inFlightFences;;			    //栅栏帧:是否画完了
 	uint32_t currentFrame = 0;
 	bool frameBufferResized = false;				    //双重保险，因为有些api在窗口变换大小后并不会返回VK_ERROR_OUT_OF_FATE
-
 
 
 
@@ -221,6 +221,7 @@ private:
 	void cleanup()
 	{
 		destroySyncObjects();           //封装了多个vkDestroySemaphore()和vkDestroyFence()
+		vkDestroyCommandPool(device, stagingCommandPool, nullptr);
 		vkDestroyCommandPool(device, commandPool, nullptr);
 		vkDestroyBuffer(device, vertexBuffer, nullptr);
 		vkFreeMemory(device, vertexBufferMemory, nullptr);
@@ -1131,42 +1132,103 @@ private:
 	//创建顶点缓冲区
 	void createVertexBuffer()
 	{
-		VkBufferCreateInfo createInfo{};
+		VkDeviceSize size = sizeof(Vertex) * vertices.size();
 
-		createInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-		createInfo.size = sizeof(vertices[0]) * vertices.size();
-		createInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
-		createInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+		VkBuffer stagingBuffer;
+		VkDeviceMemory stagingBufferMemory;
 
-		if (vkCreateBuffer(device, &createInfo, nullptr, &vertexBuffer) != VK_SUCCESS)
-		{
-			throw std::runtime_error("fail to create vertex buffer");
-		}
-
-		VkMemoryRequirements memRequirements;
-		vkGetBufferMemoryRequirements(device, vertexBuffer, &memRequirements);
-
-		VkMemoryAllocateInfo allocInfo{};
-		allocInfo.allocationSize = memRequirements.size;
-		allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-		allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+		createBuffer(size, 
+			VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 
+			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 
+			stagingBuffer, stagingBufferMemory);
 		//VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT 这个东西对于cpu可见，用于cpu向内存储顶点信息
 		//VK_MEMORY_PROPERTY_HOST_COHERENT_BIT cpu对于这块内存的更新是实时的,用于频繁需要cpu更新的内存,如果没有，需要刷新
 		/*本质：顶点数据由cpu内存掌管，gpu隐射只是去看这片内存，没有COHERENT, 数据可能在三级缓存内，没有及时更新到RAM上
 		 *需要在cpu调用vkFlushMappedMemoryRanges来把数据放到RAM上，如果有COHERENT，数据就可以直接放在RAM上
 		 */
+		void* data;
+		vkMapMemory(device, stagingBufferMemory, 0, size, 0, &data);
+		memcpy(data, vertices.data(), size);
+		vkUnmapMemory(device, stagingBufferMemory);
 
-		if (vkAllocateMemory(device, &allocInfo, nullptr, &vertexBufferMemory) != VK_SUCCESS)
+		createBuffer(size,
+			VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+			VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+			vertexBuffer, vertexBufferMemory);
+
+		copyBuffer(stagingBuffer, vertexBuffer, size);
+
+		vkFreeMemory(device, stagingBufferMemory, nullptr);
+		vkDestroyBuffer(device, stagingBuffer, nullptr);
+	}
+
+	//创建缓冲区
+	void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& bufferMemory)
+	{
+		VkBufferCreateInfo createInfo{};
+
+		createInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+		createInfo.size = size;
+		createInfo.usage = usage;
+		createInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+		if (vkCreateBuffer(device, &createInfo, nullptr, &buffer) != VK_SUCCESS)
 		{
-			throw std::runtime_error("fail to allocate vertex buffer memory");
+			throw std::runtime_error("fail to create buffer");
 		}
 
-		vkBindBufferMemory(device, vertexBuffer, vertexBufferMemory, 0);
+		VkMemoryRequirements memRequirements{};
+		vkGetBufferMemoryRequirements(device, buffer, &memRequirements);
 
-		void* data;
-		vkMapMemory(device, vertexBufferMemory, 0, createInfo.size, 0, &data);
-		memcpy(data, vertices.data(), createInfo.size);
-		vkUnmapMemory(device, vertexBufferMemory);
+		VkMemoryAllocateInfo allocInfo{};
+
+		allocInfo.allocationSize = memRequirements.size;
+		allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+		allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, properties);
+
+		if (vkAllocateMemory(device, &allocInfo, nullptr, &bufferMemory) != VK_SUCCESS)
+		{
+			throw std::runtime_error("fail to allocate memort");
+		}
+
+		vkBindBufferMemory(device, buffer, bufferMemory, 0);
+
+	}
+
+	//拷贝缓冲区
+	void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size)
+	{
+		VkCommandBufferAllocateInfo allocInfo{};
+		allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+		allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+		allocInfo.commandBufferCount = 1;
+		allocInfo.commandPool = stagingCommandPool;
+
+		VkCommandBuffer commandBuffer;
+		vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer);
+
+		VkCommandBufferBeginInfo beginInfo{};
+		beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+		beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+		vkBeginCommandBuffer(commandBuffer, &beginInfo);
+
+		VkBufferCopy copyRegion{};
+		copyRegion.srcOffset = 0;
+		copyRegion.dstOffset = 0;
+		copyRegion.size = size;
+		vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
+
+		vkEndCommandBuffer(commandBuffer);
+
+		VkSubmitInfo submitInfo{};
+		submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+		submitInfo.commandBufferCount = 1;
+		submitInfo.pCommandBuffers = &commandBuffer;
+		
+		vkQueueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
+		vkQueueWaitIdle(graphicsQueue);
+		vkFreeCommandBuffers(device, stagingCommandPool, 1, &commandBuffer);
 	}
 
 	//寻找合适的内存类型
@@ -1236,6 +1298,17 @@ private:
 		if (vkCreateCommandPool(device, &createInfo, nullptr, &commandPool) != VK_SUCCESS)
 		{
 			throw std::runtime_error("fail to create command pool");
+		}
+
+		VkCommandPoolCreateInfo stagingPoolCreateInfo{};
+
+		stagingPoolCreateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+		stagingPoolCreateInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+		stagingPoolCreateInfo.queueFamilyIndex = queueFamilyIndices.graphicsFamily.value();
+
+		if (vkCreateCommandPool(device, &stagingPoolCreateInfo, nullptr, &stagingCommandPool) != VK_SUCCESS)
+		{
+			throw std::runtime_error("fail to create staging command pool");
 		}
 	}
 
