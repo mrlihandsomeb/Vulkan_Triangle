@@ -122,9 +122,14 @@ struct Vertex
 };
 
 const std::vector<Vertex> vertices{
-	{{0.0f,-0.5f},{1.0f,1.0f,1.0f}},
-	{{0.5f,0.5f},{0.49f,0.545f,0.576f}},
-	{{-0.5f,0.5f},{0.0f,0.0f,1.0f}}
+	{{-0.5f,-0.5f},{1.0f,1.0f,1.0f}},
+	{{0.5f,-0.5f},{0.49f,0.545f,0.576f}},
+	{{0.5f,0.5f},{0.0f,0.0f,1.0f}},
+	{{-0.5f,0.5f},{0.0f,1.0f,0.0f}}
+};
+
+const std::vector<uint16_t> indices = {
+	0,1,2,2,3,0
 };
 
 class TriangleApplication
@@ -163,6 +168,8 @@ private:
 	VkCommandPool stagingCommandPool;					//为填充暂存缓冲区而准备的单独的命令池
 	VkBuffer vertexBuffer;								//顶点缓冲区	
 	VkDeviceMemory vertexBufferMemory;					//顶点缓冲区分配的内存
+	VkBuffer indexBuffer;								//索引缓冲区
+	VkDeviceMemory indexBufferMemory;					//索引缓冲区分配的内存
 	std::vector<VkSemaphore> imageAvalableSemaphores;   //信号量:image是否可以用
 	std::vector<VkSemaphore> renderFinishedSemaphores;  //信号量:image是否画完了
 	std::vector<VkFence> inFlightFences;;			    //栅栏帧:是否画完了
@@ -203,6 +210,7 @@ private:
 		createFrameBuffers();
 		createCommandPool();
 		createVertexBuffer();
+		createIndexBuffer();
 		createCommandBuffers();
 		createSyncObiects();
 	}
@@ -223,6 +231,8 @@ private:
 		destroySyncObjects();           //封装了多个vkDestroySemaphore()和vkDestroyFence()
 		vkDestroyCommandPool(device, stagingCommandPool, nullptr);
 		vkDestroyCommandPool(device, commandPool, nullptr);
+		vkDestroyBuffer(device, indexBuffer, nullptr);
+		vkFreeMemory(device, indexBufferMemory, nullptr);
 		vkDestroyBuffer(device, vertexBuffer, nullptr);
 		vkFreeMemory(device, vertexBufferMemory, nullptr);
 		destroyFrameBuffers();          //封装了多个vkDestroyFrameBuffer()来摧毁帧缓冲
@@ -1162,6 +1172,32 @@ private:
 		vkDestroyBuffer(device, stagingBuffer, nullptr);
 	}
 
+	//创建索引缓冲区
+	void createIndexBuffer()
+	{
+		VkDeviceSize size = sizeof(indices[0]) * indices.size();
+
+		VkBuffer stagingBuffer;
+		VkDeviceMemory stagingBufferMemory;
+		createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+			stagingBuffer, stagingBufferMemory);
+
+		void* data;
+		vkMapMemory(device, stagingBufferMemory, 0, size, 0, &data);
+		memcpy(data, indices.data(), (size_t)size);
+		vkUnmapMemory(device, stagingBufferMemory);
+
+		createBuffer(size, VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+			VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+			indexBuffer, indexBufferMemory);
+
+		copyBuffer(stagingBuffer, indexBuffer, size);
+		
+		vkFreeMemory(device, stagingBufferMemory, nullptr);
+		vkDestroyBuffer(device, stagingBuffer, nullptr);
+	}
+
 	//创建缓冲区
 	void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& bufferMemory)
 	{
@@ -1383,8 +1419,9 @@ private:
 		VkBuffer vertexBuffers[] = { vertexBuffer };
 		VkDeviceSize offsets[] = { 0 };
 		vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
+		vkCmdBindIndexBuffer(commandBuffer, indexBuffer, 0, VK_INDEX_TYPE_UINT16);
 
-		vkCmdDraw(commandBuffer, static_cast<uint32_t>(vertices.size()), 1, 0, 0);
+		vkCmdDrawIndexed(commandBuffer, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
 
 		vkCmdEndRenderPass(commandBuffer);
 
