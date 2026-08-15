@@ -1,7 +1,11 @@
 ﻿#define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
+
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>
 
 #include <iostream>
 #include <cstdlib>
@@ -124,10 +128,10 @@ struct Vertex
 };
 
 const std::vector<Vertex> vertices{
-	{{-0.5f,-0.5f},{1.0f,1.0f,1.0f}},
-	{{0.5f,-0.5f},{0.49f,0.545f,0.576f}},
-	{{0.5f,0.5f},{0.0f,0.0f,1.0f}},
-	{{-0.5f,0.5f},{0.0f,1.0f,0.0f}}
+	{{-0.7f,-0.7f},{1.0f,1.0f,1.0f}},
+	{{0.7f,-0.7f},{0.49f,0.545f,0.576f}},
+	{{0.7f,0.7f},{0.0f,0.0f,1.0f}},
+	{{-0.7f,0.7f},{0.0f,1.0f,0.0f}}
 };
 
 const std::vector<uint16_t> indices = {
@@ -137,9 +141,9 @@ const std::vector<uint16_t> indices = {
 //统一缓冲对象
 struct UniformBufferObject
 {
-	glm::mat4 model;	//模型变换
-	glm::mat4 view;		//视角变换
-	glm::mat4 proj;		//透视投影
+	alignas(16) glm::mat4 model;	//模型变换
+	alignas(16) glm::mat4 view;		//视角变换
+	alignas(16) glm::mat4 proj;		//透视投影
 };
 
 class TriangleApplication
@@ -191,6 +195,10 @@ private:
 	std::vector<VkFence> inFlightFences;;			    //栅栏帧:是否画完了
 	uint32_t currentFrame = 0;
 	bool frameBufferResized = false;				    //双重保险，因为有些api在窗口变换大小后并不会返回VK_ERROR_OUT_OF_FATE
+	VkImage textureImage;								//纹理图像
+	VkDeviceMemory textureImageMemory;					//纹理图像所占内存
+	VkImageView textureImageView;						//纹理图像视图
+	VkSampler textureSampler;							//纹理采样器
 
 
 
@@ -226,6 +234,9 @@ private:
 		createGraphicsPipeLine();
 		createFrameBuffers();
 		createCommandPool();
+		createTextureImage();
+		createTextureImageView();
+		createTetureSampler();
 		createVertexBuffer();
 		createIndexBuffer();
 		createUniformBuffers();
@@ -264,6 +275,10 @@ private:
 		vkDestroyRenderPass(device, renderPass, nullptr);
 		destroyImageViews();			//封装了多个vkDestroyImageView()来摧毁多个视图
 		vkDestroySwapchainKHR(device, swapChain, nullptr);
+		vkDestroySampler(device, textureSampler, nullptr);
+		vkDestroyImageView(device, textureImageView, nullptr);
+		vkFreeMemory(device, textureImageMemory, nullptr);
+		vkDestroyImage(device, textureImage, nullptr);
 		vkDestroyDevice(device, nullptr);
 		if (enableValidationLayers)
 		{
@@ -478,6 +493,7 @@ private:
 			deviceFeatures.geometryShader &&
 			indice.isComplete() &&
 			extentionSupported &&
+			deviceFeatures.samplerAnisotropy &&
 			swapChainAdequate;
 	}
 
@@ -554,6 +570,7 @@ private:
 		}
 
 		VkPhysicalDeviceFeatures deviceFeatures{};
+		deviceFeatures.samplerAnisotropy = VK_TRUE;
 
 		VkDeviceCreateInfo createInfo{};
 		createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -1368,37 +1385,15 @@ private:
 	//拷贝缓冲区
 	void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size)
 	{
-		VkCommandBufferAllocateInfo allocInfo{};
-		allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-		allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-		allocInfo.commandBufferCount = 1;
-		allocInfo.commandPool = stagingCommandPool;
-
-		VkCommandBuffer commandBuffer;
-		vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer);
-
-		VkCommandBufferBeginInfo beginInfo{};
-		beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-		beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
-		vkBeginCommandBuffer(commandBuffer, &beginInfo);
+		VkCommandBuffer stagingCommandBuffer = beginSingleTimeCommands();
 
 		VkBufferCopy copyRegion{};
 		copyRegion.srcOffset = 0;
 		copyRegion.dstOffset = 0;
 		copyRegion.size = size;
-		vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
+		vkCmdCopyBuffer(stagingCommandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
 
-		vkEndCommandBuffer(commandBuffer);
-
-		VkSubmitInfo submitInfo{};
-		submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-		submitInfo.commandBufferCount = 1;
-		submitInfo.pCommandBuffers = &commandBuffer;
-		
-		vkQueueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-		vkQueueWaitIdle(graphicsQueue);
-		vkFreeCommandBuffers(device, stagingCommandPool, 1, &commandBuffer);
+		endSingleTimeCommands(stagingCommandBuffer);
 	}
 
 	//寻找合适的内存类型
@@ -1695,6 +1690,276 @@ private:
 		{
 			vkDestroySemaphore(device, renderFinishedSemaphores[i], nullptr);
 		}
+	}
+
+	//创建纹理图像并分配内存
+	void createTextureImage()
+	{
+		int texWidth{}, texHeight{}, texChannels{};
+		stbi_uc* pixels = stbi_load("textures/texture.jpg", &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
+		VkDeviceSize size = texWidth * texHeight * 4;	//jpg图像一个像素的大小是4字节，每个通道为usinged char,大小为1字节
+
+		if (!pixels)
+		{
+			throw std::runtime_error("fail to load texture image");
+		}
+
+		VkBuffer stagingBuffer{};
+		VkDeviceMemory stagingBufferMemory{};
+		createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+			stagingBuffer, stagingBufferMemory);
+
+		void* data;
+		vkMapMemory(device, stagingBufferMemory, 0, size, 0, &data);
+		memcpy(data, pixels, static_cast<size_t>(size));
+		vkUnmapMemory(device, stagingBufferMemory);
+
+		stbi_image_free(pixels);
+
+		createImage2D(texWidth, texHeight,
+			VK_FORMAT_R8G8B8A8_SRGB,
+			VK_IMAGE_TILING_OPTIMAL,
+			VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+			VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+			textureImage, textureImageMemory);
+
+		transitionImageLayout(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+		copyBufferToImage(stagingBuffer, textureImage, static_cast<uint32_t>(texWidth), static_cast<uint32_t>(texHeight));
+		transitionImageLayout(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+		vkFreeMemory(device, stagingBufferMemory, nullptr);
+		vkDestroyBuffer(device, stagingBuffer, nullptr);
+	}
+
+	//创建纹理图像视图
+	void createTextureImageView()
+	{
+		VkImageViewCreateInfo createInfo{};
+		createInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+		createInfo.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+		createInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+		createInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+		createInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+		createInfo.format = VK_FORMAT_R8G8B8A8_SRGB;
+		createInfo.image = textureImage;
+		createInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		createInfo.subresourceRange.layerCount = 1;
+		createInfo.subresourceRange.baseArrayLayer = 0;
+		createInfo.subresourceRange.levelCount = 1;
+		createInfo.subresourceRange.baseMipLevel = 0;
+		createInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+
+		if (vkCreateImageView(device, &createInfo, nullptr, &textureImageView) != VK_SUCCESS)
+		{
+			throw std::runtime_error("fail to create texture image view");
+		}
+	}
+
+	//创建纹理采样器
+	void createTetureSampler()
+	{
+		VkPhysicalDeviceProperties properties{};
+		vkGetPhysicalDeviceProperties(physicalDevice, &properties);
+
+		VkSamplerCreateInfo createInfo{};
+		createInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+		createInfo.magFilter = VK_FILTER_LINEAR;	//几何体片段大于纹理图像，发生过采样，会产生马赛克，需要和周围像素采样求均值
+		createInfo.minFilter = VK_FILTER_LINEAR;	//几何体片段少于纹理图像，发生欠采样，会导致频繁变化的材质会变的模糊（如果以锐角观测几何体则更为严重）
+		//VK_FILTER_LINEAR 选取周围4个纹素进行平均
+		//VK_FILTER_NEAREST 选最近的对应纹素进行写入
+		createInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+		createInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+		createInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+		//UVW对应XYZ，这是寻址模式应该干什么（当纹理坐标不再处于0到1之间，如纹理为0到2，这个时候可以在一个集合体上画四个纹理）
+		//VK_SAMPLER_ADDRESS_MODE_REPEAT：在超出图像尺寸时重复纹理。
+		//VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT：类似于重复，但在超出尺寸时反转坐标以镜像图像。
+		//VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE：获取最接近超出图像尺寸的坐标的边缘颜色。
+		//VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE：类似于夹紧到边缘，但改为使用与最近边缘相反的边缘。
+		//VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER：在采样超出图像尺寸时返回纯色。
+		createInfo.anisotropyEnable = VK_TRUE;	//各向异性过滤
+		createInfo.maxAnisotropy = properties.limits.maxSamplerAnisotropy;			//最大采样数
+		createInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+		createInfo.compareEnable = VK_FALSE;	//会和一个值作比较，结果用于过滤
+		createInfo.compareOp = VK_COMPARE_OP_ALWAYS;
+		createInfo.unnormalizedCoordinates = VK_FALSE;	
+		//如果为true，则会使用(0,texWidth)(0,texHeight)当作纹理坐标轴的寻址
+		//如果为false，则会使用(0,1)作为每个轴的寻址范围
+		createInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+		createInfo.mipLodBias = 0.0f;
+		createInfo.maxLod = 0.0f;
+		createInfo.minLod = 0.0f;
+
+		if (vkCreateSampler(device, &createInfo, nullptr, &textureSampler) != VK_SUCCESS)
+		{
+			throw std::runtime_error("fail to create texture sampler");
+		}
+
+	}
+
+	//创建图像
+	void createImage2D(uint32_t width, uint32_t height,
+		VkFormat format,
+		VkImageTiling tiling,
+		VkImageUsageFlags usage,
+		VkMemoryPropertyFlags properties,
+		VkImage& image, VkDeviceMemory& imageMemory)
+	{
+		VkImageCreateInfo createInfo{};
+		createInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+		createInfo.arrayLayers = 1;
+		createInfo.extent.depth = 1;
+		createInfo.extent.width = width;
+		createInfo.extent.height = height;
+		createInfo.format = format;
+		createInfo.imageType = VK_IMAGE_TYPE_2D;
+		createInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		//VK_IMAGE_LAYOUT_UNDEFINED 不关心，随便什么样都行，最快
+		//VK_IMAGE_LAYOUT_PREINITIALIZED 告诉驱动这个图象原来有用户的数据，要保留完整的内容
+		createInfo.mipLevels = 1;
+		createInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+		createInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+		createInfo.tiling = tiling;
+		//VK_IMAGE_TILING_LINEAR：纹素按行主序排列，就像我们的 pixels 数组一样
+		//VK_IMAGE_TILING_OPTIMAL：纹素以实现定义的顺序排列，以实现最佳访问
+		createInfo.usage = usage;
+		createInfo.flags = 0;
+		//和稀疏图像相关的图像具有一些可选的flags
+		//稀疏图像：并非所有内存都有实际的像素的图像，例如为体素地形使用3d纹理，部分flags可以避免存储大量的空气值
+		//VK_IMAGE_CREATE_SPARSE_BINDING_BIT：启用“稀疏绑定”的基础能力，允许将图像绑定到一个或多个不连续的内存块上。
+		//VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT：启用“稀疏驻留”能力，允许图像在生命周期内动态地部分绑定内存。
+		//后续自己学
+
+		if (vkCreateImage(device, &createInfo, nullptr, &image) != VK_SUCCESS)
+		{
+			throw std::runtime_error("fail to create image");
+		}
+
+		VkMemoryRequirements memRequirements{};
+		vkGetImageMemoryRequirements(device, image, &memRequirements);
+
+		VkMemoryAllocateInfo allocInfo{};
+		allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+		allocInfo.allocationSize = memRequirements.size;
+		allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, properties);
+
+		if (vkAllocateMemory(device, &allocInfo, nullptr, &imageMemory) != VK_SUCCESS)
+		{
+			throw std::runtime_error("fail to allocate image memory");
+		}
+
+		vkBindImageMemory(device, image, imageMemory, 0);
+	}
+
+	//改变图像布局
+	void transitionImageLayout(VkImage image,VkFormat format,VkImageLayout oldLayout,VkImageLayout newLayout)
+	{
+		VkCommandBuffer stagingCommandBuffer = beginSingleTimeCommands();
+
+		VkImageMemoryBarrier barrier{};
+		barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+		barrier.oldLayout = oldLayout;
+		barrier.newLayout = newLayout;
+		barrier.image = image;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.srcAccessMask = 0;
+		barrier.dstAccessMask = 0;
+		barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		barrier.subresourceRange.layerCount = 1;
+		barrier.subresourceRange.baseArrayLayer = 0;
+		barrier.subresourceRange.levelCount = 1;
+		barrier.subresourceRange.baseMipLevel = 0;
+
+		VkPipelineStageFlags srcStage;
+		VkPipelineStageFlags dstStage;
+
+		if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED && newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+		{
+			barrier.srcAccessMask = 0;
+			barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+			srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+			dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;	//并不是真实存在的阶段，而是transfer发生的伪阶段
+		}
+		else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL && newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+		{
+			barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+			barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+			srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+			dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+		}
+		else
+		{
+			throw std::runtime_error("unsupported layout transition");
+		}
+
+		vkCmdPipelineBarrier(stagingCommandBuffer, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+		//第四个参数可以用0，或者VK_DEPENDENCY_BY_REGION_BIT
+		//前者表明dststage的工作要等srcstage的工作全部完成，后者表明屏障优化为区域，
+		//只要自己要操作的区域的srcstage工作完成就可以把这部分开工
+		
+		endSingleTimeCommands(stagingCommandBuffer);
+	}
+
+	//把数据从buffer放入image
+	void copyBufferToImage(VkBuffer srcBuffer,VkImage dstImage,uint32_t width,uint32_t height)
+	{
+		VkCommandBuffer stagingCommandBuffer = beginSingleTimeCommands();
+
+		VkBufferImageCopy region{};
+		region.bufferOffset = 0;
+		region.bufferImageHeight = 0;	//图像的高度是多少（0的情况下就是默认的图像的大小，非0，说明两张图像的上下之间有空隙）
+		region.bufferRowLength = 0;		//图像的宽度是多少（0就是默认图像的大小，非0，说明每张图像每行之间有间隙）
+		region.imageOffset = { 0,0,0 };
+		region.imageExtent.depth = 1;
+		region.imageExtent.width = width;
+		region.imageExtent.height = height;
+		region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		region.imageSubresource.layerCount = 1;
+		region.imageSubresource.baseArrayLayer = 0;
+		region.imageSubresource.mipLevel = 0;
+
+		vkCmdCopyBufferToImage(stagingCommandBuffer, srcBuffer, dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+		endSingleTimeCommands(stagingCommandBuffer);
+	}
+
+	//创建一个临时命令缓冲区，并开始录制
+	VkCommandBuffer beginSingleTimeCommands()
+	{
+		VkCommandBuffer stagingCommandBuffer{};
+
+		VkCommandBufferAllocateInfo allocInfo{};
+		allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+		allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+		allocInfo.commandBufferCount = 1;
+		allocInfo.commandPool = stagingCommandPool;
+
+		vkAllocateCommandBuffers(device, &allocInfo, &stagingCommandBuffer);
+
+		VkCommandBufferBeginInfo beginInfo{};
+		beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+		beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+		vkBeginCommandBuffer(stagingCommandBuffer, &beginInfo);
+
+		return stagingCommandBuffer;
+	}
+
+	//结束临时命令缓冲区的录制，并提交，再销毁
+	void endSingleTimeCommands(VkCommandBuffer stagingCommandBuffer)
+	{
+		vkEndCommandBuffer(stagingCommandBuffer);
+
+		VkSubmitInfo submitInfo{};
+		submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+		submitInfo.commandBufferCount = 1;
+		submitInfo.pCommandBuffers = &stagingCommandBuffer;
+		
+		vkQueueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
+		vkDeviceWaitIdle(device);
+
+		vkFreeCommandBuffers(device, stagingCommandPool, 1, &stagingCommandBuffer);
 	}
 };
 
