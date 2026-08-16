@@ -95,6 +95,7 @@ struct Vertex
 {
 	glm::vec2 pos;
 	glm::vec3 color;
+	glm::vec2 uv;
 
 	static VkVertexInputBindingDescription getBindDescription()
 	{
@@ -109,9 +110,9 @@ struct Vertex
 		return bindDescription;
 	}
 
-	static std::array<VkVertexInputAttributeDescription, 2> getAttributeDescriptions()
+	static std::array<VkVertexInputAttributeDescription, 3> getAttributeDescriptions()
 	{
-		std::array<VkVertexInputAttributeDescription, 2> attributeDescription{};
+		std::array<VkVertexInputAttributeDescription, 3> attributeDescription{};
 
 		attributeDescription[0].binding = 0;
 		attributeDescription[0].location = 0;  //glsl的location
@@ -123,15 +124,20 @@ struct Vertex
 		attributeDescription[1].format = VK_FORMAT_R32G32B32_SFLOAT;
 		attributeDescription[1].offset = offsetof(Vertex, color);
 
+		attributeDescription[2].binding = 0;
+		attributeDescription[2].location = 2;
+		attributeDescription[2].format = VK_FORMAT_R32G32_SFLOAT;
+		attributeDescription[2].offset = offsetof(Vertex, uv);
+
 		return attributeDescription;
 	}
 };
 
 const std::vector<Vertex> vertices{
-	{{-0.7f,-0.7f},{1.0f,1.0f,1.0f}},
-	{{0.7f,-0.7f},{0.49f,0.545f,0.576f}},
-	{{0.7f,0.7f},{0.0f,0.0f,1.0f}},
-	{{-0.7f,0.7f},{0.0f,1.0f,0.0f}}
+	{{-0.7f,-0.7f},{1.0f,1.0f,1.0f},{1.0f,0.0f}},
+	{{0.7f,-0.7f},{0.49f,0.545f,0.576f},{0.0f,0.0f}},
+	{{0.7f,0.7f},{0.0f,0.0f,1.0f},{0.0f,1.0f}},
+	{{-0.7f,0.7f},{0.0f,1.0f,0.0f},{1.0f,1.0f}}
 };
 
 const std::vector<uint16_t> indices = {
@@ -189,7 +195,7 @@ private:
 	VkDeviceMemory indexBufferMemory;					//索引缓冲区分配的内存
 	std::vector<VkBuffer> uniformBuffers;				//统一缓冲区
 	std::vector<VkDeviceMemory> uniformBuffersMemory;	//统一缓冲区分配的内存
-	std::vector<void*> uniformBuffersMapped;				//用于写入并转移到缓冲区的内存
+	std::vector<void*> uniformBuffersMapped;			//用于写入并转移到缓冲区的内存
 	std::vector<VkSemaphore> imageAvalableSemaphores;   //信号量:image是否可以用
 	std::vector<VkSemaphore> renderFinishedSemaphores;  //信号量:image是否画完了
 	std::vector<VkFence> inFlightFences;;			    //栅栏帧:是否画完了
@@ -891,10 +897,19 @@ private:
 		uboLayoutBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
 		uboLayoutBinding.pImmutableSamplers = nullptr; //仅和图像采样的描述符相关
 
+		VkDescriptorSetLayoutBinding samplerLayoutBinding{};
+		samplerLayoutBinding.binding = 1;
+		samplerLayoutBinding.descriptorCount = 1;
+		samplerLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;	//采样图像与采样器的结合产物
+		samplerLayoutBinding.pImmutableSamplers = nullptr;	//不可变采样器,词条只有在type为VK_DESCRIPTOR_TYPE_SAMPLER或者VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER才生效
+		samplerLayoutBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+		std::array<VkDescriptorSetLayoutBinding, 2>bindings{ uboLayoutBinding,samplerLayoutBinding };
+
 		VkDescriptorSetLayoutCreateInfo createInfo{};
 		createInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-		createInfo.bindingCount = 1;
-		createInfo.pBindings = &uboLayoutBinding;
+		createInfo.bindingCount = static_cast<uint32_t>(bindings.size());
+		createInfo.pBindings = bindings.data();
 
 		if (vkCreateDescriptorSetLayout(device, &createInfo, nullptr, &descriptorSetLayout) != VK_SUCCESS)
 		{
@@ -906,14 +921,16 @@ private:
 	//创建描述符池
 	void createDescriptorPool()
 	{
-		VkDescriptorPoolSize size{};
-		size.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-		size.descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+		std::array<VkDescriptorPoolSize,2> size{};
+		size[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+		size[0].descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+		size[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+		size[1].descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
 
 		VkDescriptorPoolCreateInfo createInfo{};
 		createInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-		createInfo.poolSizeCount = 1;
-		createInfo.pPoolSizes = &size;
+		createInfo.poolSizeCount = static_cast<uint32_t>(size.size());
+		createInfo.pPoolSizes = size.data();
 		createInfo.maxSets = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
 
 		if (vkCreateDescriptorPool(device, &createInfo, nullptr, &descriptorPool) != VK_SUCCESS)
@@ -947,18 +964,30 @@ private:
 			bufferInfo.offset = 0;
 			bufferInfo.range = sizeof(UniformBufferObject);
 
-			VkWriteDescriptorSet writeDescriptor{};
-			writeDescriptor.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-			writeDescriptor.descriptorCount = 1;
-			writeDescriptor.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-			writeDescriptor.dstBinding = 0;
-			writeDescriptor.dstSet = descriptorSets[i];
-			writeDescriptor.dstArrayElement = 0;		//当前写入的描述符对应描述符集中的哪一个，进而对应glsl相对应的第几个元素如ubo[0]
-			writeDescriptor.pBufferInfo = &bufferInfo;
-			writeDescriptor.pImageInfo = nullptr;
-			writeDescriptor.pTexelBufferView = nullptr;
+			VkDescriptorImageInfo imageInfo{};
+			imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+			imageInfo.imageView = textureImageView;
+			imageInfo.sampler = textureSampler;
 
-			vkUpdateDescriptorSets(device, 1, &writeDescriptor, 0, nullptr);
+			std::array<VkWriteDescriptorSet,2> writeDescriptor{};
+			writeDescriptor[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			writeDescriptor[0].descriptorCount = 1;
+			writeDescriptor[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+			writeDescriptor[0].dstBinding = 0;
+			writeDescriptor[0].dstSet = descriptorSets[i];
+			writeDescriptor[0].dstArrayElement = 0;		//当前写入的描述符对应描述符集中的哪一个，进而对应glsl相对应的第几个元素如ubo[0]
+			writeDescriptor[0].pBufferInfo = &bufferInfo;
+			writeDescriptor[0].pImageInfo = nullptr;
+			writeDescriptor[0].pTexelBufferView = nullptr;
+			writeDescriptor[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			writeDescriptor[1].descriptorCount = 1;
+			writeDescriptor[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+			writeDescriptor[1].dstArrayElement = 0;
+			writeDescriptor[1].dstBinding = 1;
+			writeDescriptor[1].dstSet = descriptorSets[i];
+			writeDescriptor[1].pImageInfo = &imageInfo;
+
+			vkUpdateDescriptorSets(device, static_cast<uint32_t>(writeDescriptor.size()), writeDescriptor.data(), 0, nullptr);
 
 		}
 	}
