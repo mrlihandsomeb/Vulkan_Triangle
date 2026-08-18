@@ -1,6 +1,7 @@
 ﻿#define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
@@ -93,7 +94,7 @@ struct SwapChainSupportDetails
 //顶点数据
 struct Vertex
 {
-	glm::vec2 pos;
+	glm::vec3 pos;
 	glm::vec3 color;
 	glm::vec2 uv;
 
@@ -116,7 +117,7 @@ struct Vertex
 
 		attributeDescription[0].binding = 0;
 		attributeDescription[0].location = 0;  //glsl的location
-		attributeDescription[0].format = VK_FORMAT_R32G32_SFLOAT; //一个坐标属性占32位
+		attributeDescription[0].format = VK_FORMAT_R32G32B32_SFLOAT; //一个坐标属性占32位
 		attributeDescription[0].offset = offsetof(Vertex, pos);
 
 		attributeDescription[1].binding = 0;
@@ -134,14 +135,20 @@ struct Vertex
 };
 
 const std::vector<Vertex> vertices{
-	{{-0.7f,-0.7f},{1.0f,1.0f,1.0f},{1.0f,0.0f}},
-	{{0.7f,-0.7f},{0.49f,0.545f,0.576f},{0.0f,0.0f}},
-	{{0.7f,0.7f},{0.0f,0.0f,1.0f},{0.0f,1.0f}},
-	{{-0.7f,0.7f},{0.0f,1.0f,0.0f},{1.0f,1.0f}}
+	{{-0.7f,-0.7f,0.0f},{1.0f,1.0f,1.0f},{1.0f,0.0f}},
+	{{0.7f,-0.7f,0.0f},{0.49f,0.545f,0.576f},{0.0f,0.0f}},
+	{{0.7f,0.7f,0.0f},{0.0f,0.0f,1.0f},{0.0f,1.0f}},
+	{{-0.7f,0.7f,0.0f},{0.0f,1.0f,0.0f},{1.0f,1.0f}},
+
+	{ { -0.7f,-0.7f,-0.5f },{1.0f,1.0f,1.0f},{1.0f,0.0f} },
+	{{0.7f,-0.7f,-0.5f},{0.49f,0.545f,0.576f},{0.0f,0.0f}},
+	{{0.7f,0.7f,-0.5f},{0.0f,0.0f,1.0f},{0.0f,1.0f}},
+	{{-0.7f,0.7f,-0.5f},{0.0f,1.0f,0.0f},{1.0f,1.0f}}
 };
 
 const std::vector<uint16_t> indices = {
-	0,1,2,2,3,0
+	0,1,2,2,3,0,
+	4,5,6,6,7,4
 };
 
 //统一缓冲对象
@@ -205,6 +212,9 @@ private:
 	VkDeviceMemory textureImageMemory;					//纹理图像所占内存
 	VkImageView textureImageView;						//纹理图像视图
 	VkSampler textureSampler;							//纹理采样器
+	VkImage depthImage;									//深度图
+	VkDeviceMemory depthImageMemory;					//深度图所占内存
+	VkImageView depthImageView;							//深度图视图
 
 
 
@@ -238,8 +248,9 @@ private:
 		createRenderPass();
 		createDescriptorSetLayout();
 		createGraphicsPipeLine();
-		createFrameBuffers();
 		createCommandPool();
+		createDepthResources();
+		createFrameBuffers();
 		createTextureImage();
 		createTextureImageView();
 		createTetureSampler();
@@ -274,6 +285,7 @@ private:
 		vkFreeMemory(device, indexBufferMemory, nullptr);
 		vkDestroyBuffer(device, vertexBuffer, nullptr);
 		vkFreeMemory(device, vertexBufferMemory, nullptr);
+		cleanUpDepthResources();		//封装了多个vkDestroyImageView(),vkFreeMemory(),vkDestroyImage()
 		destroyFrameBuffers();          //封装了多个vkDestroyFrameBuffer()来摧毁帧缓冲
 		vkDestroyPipeline(device, graphicsPipeLine, nullptr);
 		vkDestroyPipelineLayout(device, pipeLineLayout, nullptr);
@@ -775,6 +787,7 @@ private:
 
 		vkDeviceWaitIdle(device);
 
+		cleanUpDepthResources();
 		destroyFrameBuffers();
 		swapChainFramBuffers.clear();
 		destroyImageViews();
@@ -833,6 +846,7 @@ private:
 		swapChainImageFormat = surfaceFormat.format;
 		swapChainImageExtent = extent;
 
+		createDepthResources();
 		createImageViews();
 		createFrameBuffers();
 
@@ -846,34 +860,7 @@ private:
 
 		for (size_t i = 0; i < swapChainImages.size(); ++i)
 		{
-			VkImageViewCreateInfo createInfo{};
-			createInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-			createInfo.image = swapChainImages[i];
-			createInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;		//取决于image，而他默认是2d，除非启用扩展
-			createInfo.format = swapChainImageFormat;
-			createInfo.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
-			createInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
-			createInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
-			createInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
-			createInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-			//VK_IMAGE_ASPECT_DEPTH_BIT深度纹理
-			//VK_IMAGE_ASPECT_STENCIL_BIT模板纹理（是否符合模板不符合丢弃）
-			createInfo.subresourceRange.baseMipLevel = 0;
-			createInfo.subresourceRange.levelCount = 1;
-			createInfo.subresourceRange.baseArrayLayer = 0;
-			createInfo.subresourceRange.layerCount = 1;
-
-			/*
-			* 1.mipmap是类似于生成一系列根据原图降低分辨率的图像，然后根据这些图像，在渲染不同距离的东西时直接调用
-			* 节省gpu内存，有利于内存命中，还能减少画面闪烁（远处的如果实时计算，可能会在短时间有不同的样子）
-			* 2.layer是这个image具有的层数（立方体的6个面），然后视图可以决定你能看到几个面，从哪个面开始。
-			* 3.每个image可以拥有一个或多个layer，而每个layer可以拥有一个或多个mipmap。
-			*/
-
-			if (vkCreateImageView(device, &createInfo, nullptr, &swapChainImageViews[i]) != VK_SUCCESS)
-			{
-				throw std::runtime_error("fail to creat image views");
-			}
+			swapChainImageViews[i] = createImageView(swapChainImages[i], swapChainImageFormat, VK_IMAGE_ASPECT_COLOR_BIT);
 		}
 	}
 
@@ -1023,10 +1010,25 @@ private:
 		colorAttachmentRefference.attachment = 0;
 		colorAttachmentRefference.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
+		VkAttachmentDescription depthAttachment{};
+		depthAttachment.format = findDepthFormat();
+		depthAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+		depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+		depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+		depthAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+		depthAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+		depthAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		depthAttachment.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+		VkAttachmentReference depthAttachmentReference{};
+		depthAttachmentReference.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+		depthAttachmentReference.attachment = 1;
+
 		VkSubpassDescription subpass{};
 		subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
 		subpass.colorAttachmentCount = 1;
 		subpass.pColorAttachments = &colorAttachmentRefference;
+		subpass.pDepthStencilAttachment = &depthAttachmentReference;
 		/*
 		* pInputAttachments：从着色器读取的附件
 		* pResolveAttachments：用于多重采样颜色附件的附件
@@ -1037,15 +1039,21 @@ private:
 		VkSubpassDependency dependency{};    //再gpu执行子过程中的开头保安和过程中的等待保安
 		dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
 		dependency.dstSubpass = 0;
-		dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;   //等待图像管线颜色输出阶段完成后，再开始子渲染过程
-		dependency.srcAccessMask = 0;  //前一个阶段一定要完成什么，0代表啥也不干
-		dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-		dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+		dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;   //等待图像管线颜色输出阶段和深度写入完成完成后，再开始子渲染过程
+		dependency.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;  //前一个阶段一定要完成什么，0代表啥也不干
+		dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+		dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+		/*
+		* stage如果为多个阶段，满足一个即可(满足一个就开始等)
+		* acess如果为多个阶段，全部满足才行
+		*/
+
+		std::array<VkAttachmentDescription, 2> attachments{ colorAttachment,depthAttachment };
 
 		VkRenderPassCreateInfo renderPassCreateInfo{};
 		renderPassCreateInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-		renderPassCreateInfo.attachmentCount = 1;
-		renderPassCreateInfo.pAttachments = &colorAttachment;
+		renderPassCreateInfo.attachmentCount = static_cast<uint32_t>(attachments.size());
+		renderPassCreateInfo.pAttachments = attachments.data();
 		renderPassCreateInfo.subpassCount = 1;
 		renderPassCreateInfo.pSubpasses = &subpass;
 		renderPassCreateInfo.dependencyCount = 1;
@@ -1149,10 +1157,18 @@ private:
 		multiSamepleCreateInfo.alphaToOneEnable = VK_FALSE;
 
 
-		//深度和模板测试(暂时传空)
-		{
-
-		}
+		//深度和模板测试
+		VkPipelineDepthStencilStateCreateInfo depthStencilInfo{};
+		depthStencilInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+		depthStencilInfo.depthTestEnable = VK_TRUE;	//是否应将新片段的深度与深度缓冲区进行比较，以查看是否应丢弃它们
+		depthStencilInfo.depthWriteEnable = VK_TRUE;//是否应将通过深度测试的片段的新深度实际写入深度缓冲区
+		depthStencilInfo.depthCompareOp = VK_COMPARE_OP_LESS;
+		depthStencilInfo.depthBoundsTestEnable = VK_FALSE;
+		depthStencilInfo.minDepthBounds = 0.0f;
+		depthStencilInfo.maxDepthBounds = 1.0f;
+		depthStencilInfo.stencilTestEnable = VK_FALSE;
+		depthStencilInfo.front = {};
+		depthStencilInfo.back = {};
 
 
 		//颜色混合阶段
@@ -1234,7 +1250,7 @@ private:
 		createInfo.pViewportState = &viewPortCreateInfo;
 		createInfo.pMultisampleState = &multiSamepleCreateInfo;
 		createInfo.pRasterizationState = &rasterizationCreateInfo;
-		createInfo.pDepthStencilState = nullptr;
+		createInfo.pDepthStencilState = &depthStencilInfo;
 		createInfo.pColorBlendState = &colorBlendCreateInfo;
 		createInfo.pDynamicState = &dynamicCreateInfo;
 
@@ -1449,15 +1465,15 @@ private:
 
 		for (size_t i = 0; i < swapChainFramBuffers.size(); ++i)
 		{
-			VkImageView attachment[] = { swapChainImageViews[i] };
+			std::array<VkImageView, 2> attachments{ swapChainImageViews[i],depthImageView };
 
 			VkFramebufferCreateInfo createInfo{};
 			createInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
 			createInfo.renderPass = renderPass;
 			createInfo.width = swapChainImageExtent.width;
 			createInfo.height = swapChainImageExtent.height;
-			createInfo.attachmentCount = 1;
-			createInfo.pAttachments = attachment;
+			createInfo.attachmentCount = static_cast<uint32_t>(attachments.size());
+			createInfo.pAttachments = attachments.data();
 			createInfo.layers = 1;						//该帧缓冲中每个附件图像的数组层数（即图像包含多少独立的 2D 层）
 
 			if (vkCreateFramebuffer(device, &createInfo, nullptr, &swapChainFramBuffers[i]) != VK_SUCCESS)
@@ -1550,9 +1566,11 @@ private:
 		renderPassBeginInfo.framebuffer = swapChainFramBuffers[imageIndex];
 		renderPassBeginInfo.renderArea.extent = swapChainImageExtent;
 		renderPassBeginInfo.renderArea.offset = { 0,0 };
-		VkClearValue clearColor = { {{0.0f,0.0f,0.0f,1.0f}} };
-		renderPassBeginInfo.clearValueCount = 1;
-		renderPassBeginInfo.pClearValues = &clearColor;
+		std::array<VkClearValue, 2> clearValues{};
+		clearValues[0].color = { {0.0f,0.0f,0.0f,1.0f} };
+		clearValues[1].depthStencil = { 1.0f,0 };
+		renderPassBeginInfo.clearValueCount = static_cast<uint32_t>(clearValues.size());
+		renderPassBeginInfo.pClearValues = clearValues.data();
 
 		vkCmdBeginRenderPass(commandBuffer, &renderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
 		//VK_SUBPASS_CONTENTS_INLINE 渲染通道命令将嵌入到主命令缓冲区本身中，并且不会执行辅助命令缓冲区。
@@ -1764,25 +1782,7 @@ private:
 	//创建纹理图像视图
 	void createTextureImageView()
 	{
-		VkImageViewCreateInfo createInfo{};
-		createInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-		createInfo.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
-		createInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
-		createInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
-		createInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
-		createInfo.format = VK_FORMAT_R8G8B8A8_SRGB;
-		createInfo.image = textureImage;
-		createInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-		createInfo.subresourceRange.layerCount = 1;
-		createInfo.subresourceRange.baseArrayLayer = 0;
-		createInfo.subresourceRange.levelCount = 1;
-		createInfo.subresourceRange.baseMipLevel = 0;
-		createInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-
-		if (vkCreateImageView(device, &createInfo, nullptr, &textureImageView) != VK_SUCCESS)
-		{
-			throw std::runtime_error("fail to create texture image view");
-		}
+		textureImageView = createImageView(textureImage, VK_FORMAT_R8G8B8A8_SRGB,VK_IMAGE_ASPECT_COLOR_BIT);
 	}
 
 	//创建纹理采样器
@@ -1880,6 +1880,40 @@ private:
 		vkBindImageMemory(device, image, imageMemory, 0);
 	}
 
+	VkImageView createImageView(VkImage image, VkFormat format ,VkImageAspectFlags aspectMask)
+	{
+		VkImageViewCreateInfo createInfo{};
+		createInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+		createInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+		createInfo.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+		createInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+		createInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+		createInfo.format = format;
+		createInfo.image = image;
+		createInfo.subresourceRange.aspectMask = aspectMask;
+		//VK_IMAGE_ASPECT_DEPTH_BIT深度纹理
+		//VK_IMAGE_ASPECT_STENCIL_BIT模板纹理（是否符合模板不符合丢弃）
+		createInfo.subresourceRange.layerCount = 1;
+		createInfo.subresourceRange.baseArrayLayer = 0;
+		createInfo.subresourceRange.levelCount = 1;
+		createInfo.subresourceRange.baseMipLevel = 0;
+		/*
+		* 1.mipmap是类似于生成一系列根据原图降低分辨率的图像，然后根据这些图像，在渲染不同距离的东西时直接调用
+		* 节省gpu内存，有利于内存命中，还能减少画面闪烁（远处的如果实时计算，可能会在短时间有不同的样子）
+		* 2.layer是这个image具有的层数（立方体的6个面），然后视图可以决定你能看到几个面，从哪个面开始。
+		* 3.每个image可以拥有一个或多个layer，而每个layer可以拥有一个或多个mipmap。
+		*/
+		createInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;	//取决于image，而他默认是2d，除非启用扩展
+
+		VkImageView imageView{};
+		if (vkCreateImageView(device, &createInfo, nullptr, &imageView) != VK_SUCCESS)
+		{
+			throw std::runtime_error("fail to create image view");
+		}
+
+		return imageView;
+	}
+
 	//改变图像布局
 	void transitionImageLayout(VkImage image,VkFormat format,VkImageLayout oldLayout,VkImageLayout newLayout)
 	{
@@ -1900,6 +1934,19 @@ private:
 		barrier.subresourceRange.levelCount = 1;
 		barrier.subresourceRange.baseMipLevel = 0;
 
+		if (newLayout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+		{
+			barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+			if (hasStencilComponent(format))
+			{
+				barrier.subresourceRange.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+			}
+		}
+		else
+		{
+			barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		}
+
 		VkPipelineStageFlags srcStage;
 		VkPipelineStageFlags dstStage;
 
@@ -1916,6 +1963,18 @@ private:
 			barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 			srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
 			dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+		}
+		else if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED && newLayout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+		{
+			barrier.srcAccessMask = 0;
+			barrier.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
+			srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+			dstStage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+			//深度测试与模板测试同时发生再光栅化后，片段着色器之前的片段测试
+			//用于读取深度后判断是否写入片段值，然后写入片段
+			//读取发生在VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
+			//写入发生在VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT
 		}
 		else
 		{
@@ -1989,6 +2048,70 @@ private:
 		vkDeviceWaitIdle(device);
 
 		vkFreeCommandBuffers(device, stagingCommandPool, 1, &stagingCommandBuffer);
+	}
+
+	//创建深度缓冲资源
+	void createDepthResources()
+	{
+		VkFormat format = findDepthFormat();
+		createImage2D(
+			swapChainImageExtent.width, swapChainImageExtent.height,
+			format, VK_IMAGE_TILING_OPTIMAL,
+			VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+			VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+			depthImage, depthImageMemory
+		);
+
+		depthImageView = createImageView(depthImage, format, VK_IMAGE_ASPECT_DEPTH_BIT);
+
+		transitionImageLayout(depthImage, format, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+		//再cmdBeginRenderPass会自动执行
+
+	}
+
+	//销毁深度缓冲资源
+	void cleanUpDepthResources()
+	{
+		vkDestroyImageView(device, depthImageView, nullptr);
+		vkFreeMemory(device, depthImageMemory, nullptr);
+		vkDestroyImage(device, depthImage, nullptr);
+	}
+
+	//判断是否使用模板
+	bool hasStencilComponent(VkFormat format)
+	{
+		return format == VK_FORMAT_D32_SFLOAT_S8_UINT || format == VK_FORMAT_D24_UNORM_S8_UINT;
+	}
+
+	//寻找适合深度缓冲的format
+	VkFormat findDepthFormat()
+	{
+		return findSupportedFormat(
+			{ VK_FORMAT_D32_SFLOAT,VK_FORMAT_D32_SFLOAT_S8_UINT,VK_FORMAT_D24_UNORM_S8_UINT },
+			VK_IMAGE_TILING_OPTIMAL,
+			VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT
+		);
+	}
+
+	//寻找合适的format
+	VkFormat findSupportedFormat(const std::vector<VkFormat>& candidates, VkImageTiling tiling, VkFormatFeatureFlags features)
+	{
+		for (VkFormat format : candidates)
+		{
+			VkFormatProperties props;
+			vkGetPhysicalDeviceFormatProperties(physicalDevice, format, &props);
+			
+			if (tiling == VK_IMAGE_TILING_LINEAR && (props.linearTilingFeatures & features) == features)
+			{
+				return format;
+			}
+			else if (tiling == VK_IMAGE_TILING_OPTIMAL && (props.optimalTilingFeatures & features) == features)
+			{
+				return format;
+			}
+		}
+
+		throw std::runtime_error("fail to find supported format");
 	}
 };
 
