@@ -2,11 +2,16 @@
 #include <GLFW/glfw3.h>
 
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
+#define GLM_ENABLE_EXPERIMENTAL
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtx/hash.hpp>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
+
+#define TINYOBJLOADER_IMPLEMENTATION
+#include <tiny_obj_loader.h>
 
 #include <iostream>
 #include <cstdlib>
@@ -21,9 +26,12 @@
 #include <fstream>
 #include <array>
 #include <chrono>
+#include <unordered_map>
 
 const uint32_t WIDTH = 800;
 const uint32_t HEIGHT = 600;
+const std::string MODEL_PATH = "models/viking_room.obj";
+const std::string TEXTURE_PATH = "textures/viking_room.png";
 const int MAX_FRAMES_IN_FLIGHT = 2;
 
 //验证层声明
@@ -132,24 +140,25 @@ struct Vertex
 
 		return attributeDescription;
 	}
+
+	bool operator ==(const Vertex& other) const
+	{
+		return pos == other.pos && color == other.color && uv == other.uv;
+	}
 };
 
-const std::vector<Vertex> vertices{
-	{{-0.7f,-0.7f,0.0f},{1.0f,1.0f,1.0f},{1.0f,0.0f}},
-	{{0.7f,-0.7f,0.0f},{0.49f,0.545f,0.576f},{0.0f,0.0f}},
-	{{0.7f,0.7f,0.0f},{0.0f,0.0f,1.0f},{0.0f,1.0f}},
-	{{-0.7f,0.7f,0.0f},{0.0f,1.0f,0.0f},{1.0f,1.0f}},
-
-	{ { -0.7f,-0.7f,-0.5f },{1.0f,1.0f,1.0f},{1.0f,0.0f} },
-	{{0.7f,-0.7f,-0.5f},{0.49f,0.545f,0.576f},{0.0f,0.0f}},
-	{{0.7f,0.7f,-0.5f},{0.0f,0.0f,1.0f},{0.0f,1.0f}},
-	{{-0.7f,0.7f,-0.5f},{0.0f,1.0f,0.0f},{1.0f,1.0f}}
-};
-
-const std::vector<uint16_t> indices = {
-	0,1,2,2,3,0,
-	4,5,6,6,7,4
-};
+namespace std 
+{
+	template<> struct hash<Vertex>
+	{
+		size_t operator()(const Vertex& vertex) const
+		{
+			return ((hash<glm::vec3>()(vertex.pos) ^
+					(hash<glm::vec3>()(vertex.color) << 1)) << 1) ^
+					(hash<glm::vec2>()(vertex.uv) << 1);
+		}
+	};
+}
 
 //统一缓冲对象
 struct UniformBufferObject
@@ -200,6 +209,9 @@ private:
 	VkDeviceMemory vertexBufferMemory;					//顶点缓冲区分配的内存
 	VkBuffer indexBuffer;								//索引缓冲区
 	VkDeviceMemory indexBufferMemory;					//索引缓冲区分配的内存
+	std::vector<Vertex> vertices;						//顶点
+	std::unordered_map<Vertex, uint32_t> uniqueVertices;//无重复顶点
+	std::vector<uint32_t> indices;						//顶点索引
 	std::vector<VkBuffer> uniformBuffers;				//统一缓冲区
 	std::vector<VkDeviceMemory> uniformBuffersMemory;	//统一缓冲区分配的内存
 	std::vector<void*> uniformBuffersMapped;			//用于写入并转移到缓冲区的内存
@@ -254,6 +266,7 @@ private:
 		createTextureImage();
 		createTextureImageView();
 		createTetureSampler();
+		loadModel();
 		createVertexBuffer();
 		createIndexBuffer();
 		createUniformBuffers();
@@ -649,7 +662,8 @@ private:
 	{
 		for (const auto& format : availableFormats)
 		{
-			if (format.format == VK_FORMAT_B8G8R8_SRGB && format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+			//与材质的格式不同是因为windows原生的呈现方式就是B8G8R8A8
+			if (format.format == VK_FORMAT_B8G8R8A8_SRGB && format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
 			{
 				return format;
 			}
@@ -1307,6 +1321,48 @@ private:
 		return shaderModule;
 	}
 
+	//加载模型
+	void loadModel()
+	{
+		tinyobj::attrib_t attrib;					//顶点坐标，法向坐标，uv坐标
+		std::vector<tinyobj::shape_t> shapes;		//索引，因为可能有多个物体，所以有多个索引
+		std::vector<tinyobj::material_t> materials;	//顶点颜色属性，材质路径
+		std::string warn, err;
+
+		if (!tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err, MODEL_PATH.c_str()))
+		{
+			throw std::runtime_error(warn + err);
+		}
+
+		for (const auto& shape : shapes)
+		{
+			for (const auto& index : shape.mesh.indices)
+			{
+				Vertex vertex{};
+
+				vertex.pos = {
+					attrib.vertices[3 * index.vertex_index + 0],
+					attrib.vertices[3 * index.vertex_index + 1],
+					attrib.vertices[3 * index.vertex_index + 2]
+				};
+				vertex.color = { 1.0f,1.0f,1.0f };	//颜色取自材质贴图，故没有颜色
+				vertex.uv = {
+					attrib.texcoords[2 * index.texcoord_index + 0],
+					1.0f-attrib.texcoords[2 * index.texcoord_index + 1]
+				};
+				//obj格式默认坐标0点在下方，而vulkan0点在上方。所以需要把uv坐标的垂直轴上下翻转，1.0f是因为
+
+				if (uniqueVertices.count(vertex) == 0)
+				{
+					uniqueVertices[vertex] = static_cast<uint32_t>(vertices.size());
+					vertices.push_back(vertex);
+				}
+				
+				indices.push_back(uniqueVertices[vertex]);
+			}
+		}
+	}
+
 	//创建顶点缓冲区
 	void createVertexBuffer()
 	{
@@ -1595,7 +1651,7 @@ private:
 		VkBuffer vertexBuffers[] = { vertexBuffer };
 		VkDeviceSize offsets[] = { 0 };
 		vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
-		vkCmdBindIndexBuffer(commandBuffer, indexBuffer, 0, VK_INDEX_TYPE_UINT16);
+		vkCmdBindIndexBuffer(commandBuffer, indexBuffer, 0, VK_INDEX_TYPE_UINT32);
 		vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
 			pipeLineLayout, 0, 1, &descriptorSets[currentFrame], 0, nullptr);
 
@@ -1685,7 +1741,7 @@ private:
 		float time = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - startTime).count();
 
 		UniformBufferObject ubo{};
-		ubo.model = glm::rotate(glm::mat4(1.0f), time * glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+		ubo.model = glm::rotate(glm::mat4(1.0f), time * glm::radians(45.0f), glm::vec3(0.0f, 0.0f, 1.0f));
 		ubo.view = glm::lookAt(glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f));
 		ubo.proj = glm::perspective(glm::radians(45.0f), swapChainImageExtent.width / (float)swapChainImageExtent.height, 0.1f, 10.0f);
 		ubo.proj[1][1] *= -1;
@@ -1743,7 +1799,7 @@ private:
 	void createTextureImage()
 	{
 		int texWidth{}, texHeight{}, texChannels{};
-		stbi_uc* pixels = stbi_load("textures/texture.jpg", &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
+		stbi_uc* pixels = stbi_load(TEXTURE_PATH.c_str(), &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
 		VkDeviceSize size = texWidth * texHeight * 4;	//jpg图像一个像素的大小是4字节，每个通道为usinged char,大小为1字节
 
 		if (!pixels)
